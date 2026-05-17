@@ -1,0 +1,150 @@
+---
+title: "Monthly Executive Banking Dashboard"
+subtitle: "FSI Demo - Key Performance Indicators & Trends"
+author: "FSI Analytics Team"
+date: today
+format: html
+execute:
+  echo: false
+  warning: false
+---
+
+```{r}
+library(DBI)
+library(tidyverse)
+library(ggplot2)
+library(gt)
+library(plotly)
+
+con <- conn
+```
+
+## Executive Summary
+
+```{r}
+# KPI Query
+kpi_query <- "
+SELECT 
+  SUM(NET_REVENUE) as TOTAL_REVENUE,
+  COUNT(DISTINCT CUSTOMER_KEY) as ACTIVE_CUSTOMERS,
+  AVG(CURRENT_BALANCE) as AVG_BALANCE,
+  SUM(CASE WHEN IS_DORMANT = 1 THEN 1 ELSE 0 END) / COUNT(*) as DORMANCY_RATE
+FROM FSI_DEMO.ANALYTICS_BANKING.FACT_CUSTOMER_REVENUE cr
+LEFT JOIN FSI_DEMO.ANALYTICS_BANKING.FACT_ACCOUNT_BALANCE_DAILY ab 
+  ON cr.CUSTOMER_KEY = ab.CUSTOMER_KEY
+WHERE MONTH(CURRENT_DATE()) = MONTH(cr.MONTH_KEY)
+"
+
+kpis <- dbGetQuery(con, kpi_query)
+```
+
+::: {.grid}
+
+::: {.g-col-3}
+### Total Revenue
+```{r}
+paste("$", format(kpis$TOTAL_REVENUE[1], big.mark=",", digits=0))
+```
+:::
+
+::: {.g-col-3}
+### Active Customers
+```{r}
+format(kpis$ACTIVE_CUSTOMERS[1], big.mark=",")
+```
+:::
+
+::: {.g-col-3}
+### Avg Balance
+```{r}
+paste("$", format(kpis$AVG_BALANCE[1], big.mark=",", digits=0))
+```
+:::
+
+::: {.g-col-3}
+### Dormancy Rate
+```{r}
+paste(round(kpis$DORMANCY_RATE[1]*100, 2), "%")
+```
+:::
+
+:::
+
+## Revenue by Product
+
+```{r}
+revenue_by_product <- dbGetQuery(con, "
+SELECT 
+  p.PRODUCT_NAME,
+  SUM(cr.NET_REVENUE) as REVENUE,
+  COUNT(DISTINCT cr.CUSTOMER_KEY) as CUSTOMER_COUNT
+FROM FSI_DEMO.ANALYTICS_BANKING.FACT_CUSTOMER_REVENUE cr
+LEFT JOIN FSI_DEMO.CORE_BANKING.DIM_PRODUCT p ON cr.PRODUCT_KEY = p.PRODUCT_KEY
+GROUP BY p.PRODUCT_NAME
+ORDER BY REVENUE DESC
+")
+
+ggplot(revenue_by_product, aes(x = reorder(PRODUCT_NAME, REVENUE), y = REVENUE)) +
+  geom_col(fill = "#1f77b4") +
+  coord_flip() +
+  labs(title = "Revenue by Product", x = "", y = "Revenue ($)") +
+  theme_minimal()
+```
+
+## Top 10 Branches by Revenue
+
+```{r}
+top_branches <- dbGetQuery(con, "
+SELECT 
+  b.BRANCH_NAME,
+  b.REGION,
+  SUM(cr.NET_REVENUE) as REVENUE
+FROM FSI_DEMO.ANALYTICS_BANKING.FACT_CUSTOMER_REVENUE cr
+LEFT JOIN FSI_DEMO.CORE_BANKING.DIM_BRANCH b ON cr.BRANCH_KEY = b.BRANCH_KEY
+GROUP BY b.BRANCH_NAME, b.REGION
+ORDER BY REVENUE DESC
+LIMIT 10
+")
+
+gt(top_branches) |>
+  fmt_currency(columns = REVENUE, currency = "USD")
+```
+
+## Churn Risk Distribution
+
+```{r}
+churn_dist <- dbGetQuery(con, "
+SELECT 
+  CHURN_RISK_SEGMENT,
+  COUNT(*) as CUSTOMER_COUNT
+FROM FSI_DEMO.ANALYTICS_BANKING.ML_CHURN_SCORES
+GROUP BY CHURN_RISK_SEGMENT
+")
+
+ggplot(churn_dist, aes(x = CHURN_RISK_SEGMENT, y = CUSTOMER_COUNT, fill = CHURN_RISK_SEGMENT)) +
+  geom_col() +
+  labs(title = "Customers by Churn Risk", x = "Risk Segment", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Monthly Trends
+
+```{r}
+monthly_trends <- dbGetQuery(con, "
+SELECT 
+  MONTH_KEY,
+  SUM(NET_REVENUE) as REVENUE,
+  COUNT(DISTINCT CUSTOMER_KEY) as CUSTOMERS
+FROM FSI_DEMO.ANALYTICS_BANKING.FACT_CUSTOMER_REVENUE
+GROUP BY MONTH_KEY
+ORDER BY MONTH_KEY DESC
+LIMIT 12
+")
+
+ggplot(monthly_trends, aes(x = MONTH_KEY, y = REVENUE)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Revenue Trend (Last 12 Months)", x = "Month", y = "Revenue ($)") +
+  theme_minimal()
+```

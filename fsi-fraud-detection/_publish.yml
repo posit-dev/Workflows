@@ -1,0 +1,73 @@
+# Posit Connect Publishing Configuration
+# Deploy FSI Demo to Posit Connect
+
+publish:
+  - source: fsi-demo/models/churn_prediction.qmd
+    destination: connect
+    title: "Customer Churn Prediction Model"
+    description: "XGBoost model with SHAP explanations for customer churn prediction"
+    tags:
+      - ml
+      - python
+      - churn
+    schedule: "0 2 * * *"  # Daily at 2 AM
+
+  - source: fsi-demo/models/fraud_detection.qmd
+    destination: connect
+    title: "Transaction Fraud Detection"
+    description: "Isolation Forest anomaly detection for transaction fraud"
+    tags:
+      - ml
+      - python
+      - fraud
+    schedule: "0 3 * * *"  # Daily at 3 AM
+
+  - source: fsi-demo/models/customer_segmentation.qmd
+    destination: connect
+    title: "Customer Segmentation Analysis"
+    description: "K-Means clustering for customer segmentation"
+    tags:
+      - ml
+      - r
+      - segmentation
+    schedule: "0 4 * * *"  # Daily at 4 AM
+
+  - source: fsi-demo/reports/monthly_executive.qmd
+    destination: connect
+    title: "Monthly Executive Banking Dashboard"
+    description: "KPIs, trends, and performance metrics"
+    tags:
+      - report
+      - executive
+      - monthly
+    schedule: "0 8 1 * *"  # First day of month at 8 AM
+
+  - source: fsi-demo/reports/weekly_risk_fraud.qmd
+    destination: connect
+    title: "Weekly Risk & Fraud Report"
+    description: "Delinquency, fraud, and credit score analysis"
+    tags:
+      - report
+      - risk
+      - weekly
+    schedule: "0 9 * * 1"  # Every Monday at 9 AM
+
+  - source: fsi-demo/dashboards/app.py
+    destination: connect
+    title: "Real-Time Transaction Dashboard"
+    description: "Live transaction monitoring, customer 360, portfolio health"
+    tags:
+      - dashboard
+      - shiny
+      - realtime
+    bundle:
+      - requirements.txt
+      - fsi-demo/dashboards/app.py
+
+# Environment variables for Snowflake connection
+environment:
+  SNOWFLAKE_USER: "${SNOWFLAKE_USER}"
+  SNOWFLAKE_PASSWORD: "${SNOWFLAKE_PASSWORD}"
+  SNOWFLAKE_ACCOUNT: "${SNOWFLAKE_ACCOUNT}"
+  SNOWFLAKE_WAREHOUSE: "COMPUTE_WH"
+  SNOWFLAKE_DATABASE: "FSI_DEMO"

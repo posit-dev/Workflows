@@ -1,0 +1,8 @@
+shiny
+pandas>=2.0.0
+plotly
+snowflake-snowpark-python>=1.11.0
+snowflake-connector-python[pandas]>=3.0.0
+pyarrow>=10.0.0
+numpy
+shinywidgets

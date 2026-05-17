@@ -1,0 +1,65 @@
+{
+  "R": "4.5.1",
+  "Repositories": [
+    {
+      "Name": "CRAN",
+      "URL": "https://cran.rstudio.com"
+    }
+  ],
+  "Packages": {
+    "DBI": {
+      "Package": "DBI",
+      "Version": "1.1.3",
+      "Source": "Repository",
+      "Repository": "CRAN"
+    },
+    "odbc": {
+      "Package": "odbc",
+      "Version": "1.4.0",
+      "Source": "Repository",
+      "Repository": "CRAN"
+    },
+    "tidyverse": {
+      "Package": "tidyverse",
+      "Version": "2.0.0",
+      "Source": "Repository",
+      "Repository": "CRAN"
+    },
+    "tidymodels": {
+      "Package": "tidymodels",
+      "Version": "1.1.0",
+      "Source": "Repository",
+      "Repository": "CRAN"
+    },
+    "ggplot2": {
+      "Package": "ggplot2",
+      "Version": "3.4.2",
+      "Source": "Repository",
+      "Repository": "CRAN"
+    },
+    "plotly": {
+      "Package": "plotly",
+      "Version": "4.10.1",
+      "Source": "Repository",
+      "Repository": "CRAN"
+    },
+    "gt": {
+      "Package": "gt",
+      "Version": "0.9.0",
+      "Source": "Repository",
+      "Repository": "CRAN"
+    },
+    "quarto": {
+      "Package": "quarto",
+      "Version": "1.3",
+      "Source": "Repository",
+      "Repository": "CRAN"
+    },
+    "pins": {
+      "Package": "pins",
+      "Version": "1.2.0",
+      "Source": "Repository",
+      "Repository": "CRAN"
+    }
+  }
+}

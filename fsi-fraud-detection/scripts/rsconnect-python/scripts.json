@@ -1,0 +1,12 @@
+{
+    "https://connect/": {
+        "server_url": "https://connect/",
+        "filename": "/home/ASHLEIGH.BYNUM.POSIT.CO/snowflake_demos/fsi_demo/scripts",
+        "app_url": "https://a4dwmqd-duloftf-posit-software-pbc-staging.snowflakecomputing.app/content/7e5d8668-64b8-465f-8450-2095c8067c19/",
+        "app_id": "73",
+        "app_guid": "7e5d8668-64b8-465f-8450-2095c8067c19",
+        "title": "Fraud Scoring Engine",
+        "app_mode": "python-fastapi",
+        "app_store_version": 1
+    }
+}

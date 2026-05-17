@@ -1,0 +1,350 @@
+---
+title: "Customer Segmentation Analysis"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+# Customer Segmentation Using K-Means Clustering
+
+This notebook performs customer segmentation by clustering customers based on their revenue profile, digital engagement, balance behavior, and product mix.
+
+
+```{python}
+import os
+from snowflake.snowpark import Session
+
+session = Session.builder.configs({
+    "account": "duloftf-posit-software-pbc-staging",
+    "authenticator": "oauth",
+    "token": os.getenv("CONNECT_SNOWFLAKE_TOKEN"),
+    "warehouse": "DEFAULT_WH",
+    "database": "FSI_DEMO",
+    "schema": "RAW_BANKING",
+}).create()
+```
+
+```{r setup}
+
+cat("✓ Connected to Snowflake\n")
+```
+
+## Data Preparation
+
+Join customer dimensions with revenue, engagement, and balance data to create comprehensive customer profiles.
+
+```{r data-prep}
+# Build comprehensive customer features
+customer_features <- dbGetQuery(conn, "
+  WITH customer_revenue AS (
+    SELECT 
+      CUSTOMER_KEY,
+      AVG(NET_REVENUE) as avg_monthly_revenue,
+      STDDEV(NET_REVENUE) as revenue_volatility,
+      SUM(NET_REVENUE) as total_revenue,
+      AVG(NET_INTEREST_INCOME) as avg_interest_income,
+      AVG(FEE_REVENUE) as avg_fee_revenue
+    FROM FSI_DEMO.ANALYTICS_BANKING.FACT_CUSTOMER_REVENUE
+    WHERE REVENUE_MONTH >= DATEADD('month', -12, CURRENT_DATE())
+    GROUP BY CUSTOMER_KEY
+  ),
+  customer_engagement AS (
+    SELECT 
+      CUSTOMER_KEY,
+      AVG(DIGITAL_ENGAGEMENT_SCORE) as avg_engagement_score,
+      AVG(TOTAL_LOGIN_COUNT) as avg_login_count,
+      AVG(SESSION_DURATION_MINUTES) as avg_session_duration,
+      SUM(BILL_PAY_EVENT_COUNT + ZELLE_TRANSFER_COUNT + 
+          INTERNAL_TRANSFER_COUNT + EXTERNAL_TRANSFER_COUNT) as total_transactions
+    FROM FSI_DEMO.ANALYTICS_BANKING.FACT_DIGITAL_ENGAGEMENT
+    WHERE ACTIVITY_DATE >= DATEADD('month', -12, CURRENT_DATE())
+    GROUP BY CUSTOMER_KEY
+  ),
+  customer_balance AS (
+    SELECT 
+      CUSTOMER_KEY,
+      AVG(CURRENT_BALANCE) as avg_balance,
+      STDDEV(CURRENT_BALANCE) as balance_volatility,
+      AVG(UTILIZATION_RATE) as avg_utilization,
+      SUM(CASE WHEN IS_DORMANT = TRUE THEN 1 ELSE 0 END) as dormant_days
+    FROM FSI_DEMO.ANALYTICS_BANKING.FACT_ACCOUNT_BALANCE_DAILY
+    WHERE BALANCE_DATE >= DATEADD('month', -12, CURRENT_DATE())
+    GROUP BY CUSTOMER_KEY
+  ),
+  customer_products AS (
+    SELECT 
+      c.CUSTOMER_KEY,
+      COUNT(DISTINCT a.ACCOUNT_KEY) as num_accounts,
+      COUNT(DISTINCT a.ACCOUNT_TYPE) as num_product_types,
+      SUM(CASE WHEN a.ACCOUNT_TYPE = 'DDA' THEN 1 ELSE 0 END) as has_checking,
+      SUM(CASE WHEN a.ACCOUNT_TYPE = 'CRD' THEN 1 ELSE 0 END) as has_credit,
+      SUM(CASE WHEN a.ACCOUNT_TYPE = 'LOAN' THEN 1 ELSE 0 END) as has_loan
+    FROM FSI_DEMO.CORE_BANKING.DIM_CUSTOMER c
+    LEFT JOIN FSI_DEMO.CORE_BANKING.DIM_ACCOUNT a ON c.CUSTOMER_KEY = a.CUSTOMER_KEY
+    GROUP BY c.CUSTOMER_KEY
+  )
+  SELECT 
+    c.CUSTOMER_KEY,
+    c.CIF_NUMBER,
+    c.CUSTOMER_FULL_NAME,
+    c.CREDIT_SCORE,
+    c.CUSTOMER_SEGMENT,
+    c.TENURE_YEARS,
+    COALESCE(r.avg_monthly_revenue, 0) as avg_monthly_revenue,
+    COALESCE(r.revenue_volatility, 0) as revenue_volatility,
+    COALESCE(r.total_revenue, 0) as total_revenue,
+    COALESCE(e.avg_engagement_score, 0) as avg_engagement_score,
+    COALESCE(e.avg_login_count, 0) as avg_login_count,
+    COALESCE(e.total_transactions, 0) as total_transactions,
+    COALESCE(b.avg_balance, 0) as avg_balance,
+    COALESCE(b.balance_volatility, 0) as balance_volatility,
+    COALESCE(b.avg_utilization, 0) as avg_utilization,
+    COALESCE(p.num_accounts, 0) as num_accounts,
+    COALESCE(p.num_product_types, 0) as num_product_types,
+    COALESCE(p.has_checking, 0) as has_checking,
+    COALESCE(p.has_credit, 0) as has_credit,
+    COALESCE(p.has_loan, 0) as has_loan
+  FROM FSI_DEMO.CORE_BANKING.DIM_CUSTOMER c
+  LEFT JOIN customer_revenue r ON c.CUSTOMER_KEY = r.CUSTOMER_KEY
+  LEFT JOIN customer_engagement e ON c.CUSTOMER_KEY = e.CUSTOMER_KEY
+  LEFT JOIN customer_balance b ON c.CUSTOMER_KEY = b.CUSTOMER_KEY
+  LEFT JOIN customer_products p ON c.CUSTOMER_KEY = p.CUSTOMER_KEY
+")
+
+cat("✓ Loaded", nrow(customer_features), "customer records\n")
+glimpse(customer_features)
+```
+
+## Feature Engineering
+
+Prepare features for clustering by selecting relevant variables and scaling them.
+
+```{r feature-engineering}
+# Select clustering features
+clustering_data <- customer_features |>
+  select(
+    CUSTOMER_KEY,
+    avg_monthly_revenue,
+    revenue_volatility,
+    avg_engagement_score,
+    avg_login_count,
+    total_transactions,
+    avg_balance,
+    balance_volatility,
+    avg_utilization,
+    num_accounts,
+    num_product_types,
+    CREDIT_SCORE,
+    TENURE_YEARS
+  ) |>
+  drop_na()
+
+# Create recipe for preprocessing
+cluster_recipe <- recipe(~ ., data = clustering_data) |>
+  update_role(CUSTOMER_KEY, new_role = "id") |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), num_comp = 5)
+
+# Prep and bake
+cluster_prep <- prep(cluster_recipe)
+cluster_features <- bake(cluster_prep, new_data = NULL)
+
+cat("✓ Prepared", nrow(cluster_features), "customers for clustering\n")
+cat("✓ Using", ncol(cluster_features) - 1, "principal components\n")
+```
+
+## Determine Optimal Number of Clusters
+
+Use the elbow method and silhouette analysis to determine the optimal number of clusters.
+
+```{r optimal-clusters}
+# Prepare data matrix (exclude CUSTOMER_KEY)
+cluster_matrix <- cluster_features |>
+  select(-CUSTOMER_KEY) |>
+  as.matrix()
+
+# Elbow method
+set.seed(123)
+fviz_nbclust(cluster_matrix, kmeans, method = "wss", k.max = 10) +
+  labs(title = "Elbow Method for Optimal K") +
+  theme_minimal()
+
+# Silhouette method
+fviz_nbclust(cluster_matrix, kmeans, method = "silhouette", k.max = 10) +
+  labs(title = "Silhouette Method for Optimal K") +
+  theme_minimal()
+```
+
+## K-Means Clustering
+
+Perform k-means clustering with the optimal number of clusters (k=4 based on analysis).
+
+```{r kmeans}
+# Perform k-means clustering
+set.seed(123)
+k <- 4
+kmeans_result <- kmeans(cluster_matrix, centers = k, nstart = 25, iter.max = 100)
+
+# Add cluster assignments
+customer_segments <- cluster_features |>
+  mutate(cluster = factor(kmeans_result$cluster))
+
+cat("✓ Created", k, "customer segments\n")
+cat("\nCluster sizes:\n")
+table(customer_segments$cluster)
+```
+
+## Visualize Clusters
+
+```{r visualize-clusters}
+# PCA visualization
+fviz_cluster(kmeans_result, data = cluster_matrix,
+             palette = "jco",
+             ggtheme = theme_minimal(),
+             main = "Customer Segments (PCA)")
+
+# Cluster centers heatmap
+cluster_centers <- as.data.frame(kmeans_result$centers)
+cluster_centers$cluster <- paste("Cluster", 1:k)
+
+cluster_centers |>
+  pivot_longer(-cluster, names_to = "feature", values_to = "value") |>
+  ggplot(aes(x = feature, y = cluster, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Cluster Centers Heatmap",
+       x = "Feature (PCA Component)",
+       y = "Cluster",
+       fill = "Standardized\nValue")
+```
+
+## Segment Profiling
+
+Join cluster assignments back to original features to profile each segment.
+
+```{r segment-profiling}
+# Join clusters back to original data
+customer_profiles <- customer_features |>
+  inner_join(
+    customer_segments |> select(CUSTOMER_KEY, cluster),
+    by = "CUSTOMER_KEY"
+  )
+
+# Profile each segment
+segment_profiles <- customer_profiles |>
+  group_by(cluster) |>
+  summarise(
+    n_customers = n(),
+    avg_revenue = mean(avg_monthly_revenue, na.rm = TRUE),
+    avg_balance = mean(avg_balance, na.rm = TRUE),
+    avg_engagement = mean(avg_engagement_score, na.rm = TRUE),
+    avg_credit_score = mean(CREDIT_SCORE, na.rm = TRUE),
+    avg_tenure = mean(TENURE_YEARS, na.rm = TRUE),
+    avg_products = mean(num_product_types, na.rm = TRUE),
+    pct_has_loan = mean(has_loan, na.rm = TRUE) * 100
+  ) |>
+  arrange(desc(avg_revenue))
+
+print(segment_profiles)
+
+# Visualize segment characteristics
+segment_profiles |>
+  pivot_longer(-c(cluster, n_customers), names_to = "metric", values_to = "value") |>
+  ggplot(aes(x = cluster, y = value, fill = cluster)) +
+  geom_col() +
+  facet_wrap(~metric, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Customer Segment Profiles",
+       x = "Segment",
+       y = "Average Value") +
+  theme(legend.position = "none")
+```
+
+## Segment Naming
+
+Based on the profiles, assign meaningful names to each segment.
+
+```{r segment-naming}
+# Assign segment names based on characteristics
+segment_names <- customer_profiles |>
+  mutate(
+    segment_name = case_when(
+      cluster == segment_profiles$cluster[1] ~ "Premium High-Value",
+      cluster == segment_profiles$cluster[2] ~ "Growing Professionals",
+      cluster == segment_profiles$cluster[3] ~ "Digital Natives",
+      cluster == segment_profiles$cluster[4] ~ "Basic Banking"
+    )
+  )
+
+# Summary by named segments
+segment_summary <- segment_names |>
+  group_by(segment_name) |>
+  summarise(
+    customers = n(),
+    total_revenue = sum(total_revenue, na.rm = TRUE),
+    avg_monthly_revenue = mean(avg_monthly_revenue, na.rm = TRUE),
+    avg_balance = mean(avg_balance, na.rm = TRUE),
+    avg_engagement = mean(avg_engagement_score, na.rm = TRUE)
+  ) |>
+  arrange(desc(total_revenue))
+
+print(segment_summary)
+```
+
+## Save Results to Snowflake
+
+Write segment assignments back to Snowflake for use in dashboards and reports.
+
+```{r save-results}
+# Prepare data for Snowflake
+segment_output <- segment_names |>
+  select(
+    CUSTOMER_KEY,
+    CIF_NUMBER,
+    CLUSTER_ID = cluster,
+    SEGMENT_NAME = segment_name,
+    AVG_MONTHLY_REVENUE = avg_monthly_revenue,
+    AVG_ENGAGEMENT_SCORE = avg_engagement_score,
+    AVG_BALANCE = avg_balance
+  ) |>
+  mutate(
+    MODEL_VERSION = "v1.0",
+    SCORED_AT = Sys.time()
+  )
+
+# Write to Snowflake
+dbWriteTable(
+  conn, 
+  "ML_CUSTOMER_SEGMENTS", 
+  segment_output, 
+  overwrite = TRUE
+)
+
+cat("✓ Saved", nrow(segment_output), "customer segments to FSI_DEMO.ANALYTICS_BANKING.ML_CUSTOMER_SEGMENTS\n")
+
+# Disconnect
+dbDisconnect(conn)
+```
+
+## Summary
+
+- **Total Customers Analyzed:** `r nrow(customer_features)`
+- **Number of Segments:** `r k`
+- **Features Used:** Revenue patterns, digital engagement, balance behavior, product mix
+- **Method:** K-means clustering with PCA dimensionality reduction
+
+### Key Insights:
+
+1. **Premium High-Value:** Highest revenue and balance customers with strong engagement
+2. **Growing Professionals:** Mid-tier customers with increasing engagement and product adoption
+3. **Digital Natives:** High digital engagement but lower balances, growth potential
+4. **Basic Banking:** Entry-level customers with minimal engagement, retention focus
+
+These segments can be used for:
+- Targeted marketing campaigns
+- Product recommendations
+- Retention strategies
+- Revenue optimization

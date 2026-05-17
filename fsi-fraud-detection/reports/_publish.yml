@@ -1,0 +1,5 @@
+- source: project
+  connect:
+    - id: fsi-dashboard
+      server: https://connect/
+      account: CONNECT_API_KEY

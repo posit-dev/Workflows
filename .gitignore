@@ -1,0 +1,40 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+*.pkl
+
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+renv/
+
+# Environment files
+.env
+.env.local
+connections.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.posit/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs
+outputs/
+*.log
+
+# Data files (if large)
+*.csv
+*.parquet
+*.feather

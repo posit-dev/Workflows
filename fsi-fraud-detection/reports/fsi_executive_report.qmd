@@ -1,0 +1,369 @@
+---
+title: "FSI Executive Dashboard"
+subtitle: "AmeriFirst Banking — Monthly Revenue & Portfolio Health"
+author: "Ashleigh Bynum"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    embed-resources: true
+jupyter: python3
+---
+
+```{python}
+#| label: setup
+#| include: false
+
+import os
+import warnings
+import sys
+warnings.filterwarnings("ignore")
+
+import snowflake.connector
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+conn_params = {
+    "account": os.getenv("SNOWFLAKE_ACCOUNT", "duloftf-posit-software-pbc-staging"),
+    "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE", "DEFAULT_WH"),
+    "database": "FSI_DEMO",
+    "schema": "ANALYTICS_BANKING",
+}
+
+snowflake_token = None
+
+connect_server = os.getenv("CONNECT_SERVER")
+connect_api_key = os.getenv("CONNECT_API_KEY")
+if connect_server and connect_api_key:
+    import urllib.request, json
+    req = urllib.request.Request(
+        f"{connect_server}v1/oauth/integrations/credentials",
+        method="POST",
+        headers={
+            "Authorization": f"Key {connect_api_key}",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({"connector_type": "snowflake"}).encode(),
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            creds = json.loads(resp.read())
+        snowflake_token = creds.get("access_token") or creds.get("token")
+        print(f"[auth] Got Snowflake token via Connect OAuth integration", file=sys.stderr)
+    except Exception as e:
+        print(f"[auth] Connect OAuth credential exchange failed: {e}", file=sys.stderr)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                print(f"[auth] Response: {resp.read()}", file=sys.stderr)
+        except:
+            pass
+
+if not snowflake_token:
+    snowflake_token = os.getenv("SNOWFLAKE_TOKEN")
+
+if snowflake_token:
+    conn_params["token"] = snowflake_token
+    conn_params["authenticator"] = "oauth"
+    host = os.getenv("SNOWFLAKE_HOST", "")
+    if host:
+        conn_params["host"] = host
+else:
+    sf_home = os.getenv("SNOWFLAKE_HOME", "")
+    if sf_home:
+        toml_path = os.path.join(sf_home, "connections.toml")
+        if os.path.exists(toml_path):
+            try:
+                import tomllib
+            except ImportError:
+                import tomli as tomllib
+            with open(toml_path, "rb") as f:
+                cfg = tomllib.load(f)
+            wb = cfg.get("workbench", {})
+            conn_params["account"] = wb.get("account", conn_params["account"])
+            conn_params["token"] = wb.get("token", "")
+            conn_params["authenticator"] = wb.get("authenticator", "oauth")
+
+conn = snowflake.connector.connect(**conn_params)
+cur = conn.cursor()
+
+def query(sql):
+    cur.execute(sql)
+    cols = [desc[0] for desc in cur.description]
+    return pd.DataFrame(cur.fetchall(), columns=cols)
+```
+
+## Revenue Summary
+
+```{python}
+#| label: revenue-data
+
+revenue = query("""
+    SELECT REVENUE_MONTH,
+           COUNT(DISTINCT CUSTOMER_KEY) AS CUSTOMERS,
+           SUM(TOTAL_REVENUE) AS TOTAL_REVENUE,
+           SUM(NET_REVENUE) AS NET_REVENUE,
+           SUM(FEE_REVENUE) AS FEE_REVENUE,
+           SUM(NET_INTEREST_INCOME) AS NII,
+           SUM(INTERCHANGE_REVENUE) AS INTERCHANGE,
+           SUM(LOAN_ORIGINATION_REVENUE) AS LOAN_ORIG
+    FROM FSI_DEMO.ANALYTICS_BANKING.FACT_CUSTOMER_REVENUE
+    GROUP BY REVENUE_MONTH
+    ORDER BY REVENUE_MONTH
+""")
+
+revenue["REVENUE_MONTH"] = pd.to_datetime(revenue["REVENUE_MONTH"])
+
+latest = revenue[revenue["CUSTOMERS"] > 500].iloc[-1]
+prev = revenue[revenue["CUSTOMERS"] > 500].iloc[-2]
+```
+
+```{python}
+#| label: kpi-cards
+
+from IPython.display import HTML, display
+
+def pct_change(current, previous):
+    if previous == 0:
+        return 0
+    return ((current - previous) / previous) * 100
+
+rev_chg = pct_change(latest["TOTAL_REVENUE"], prev["TOTAL_REVENUE"])
+net_chg = pct_change(latest["NET_REVENUE"], prev["NET_REVENUE"])
+nii_chg = pct_change(latest["NII"], prev["NII"])
+
+def arrow(val):
+    return "▲" if val >= 0 else "▼"
+
+def color(val):
+    return "#2ecc71" if val >= 0 else "#e74c3c"
+
+html = f"""
+<div style="display:flex; gap:20px; margin:20px 0;">
+  <div style="flex:1; background:#f8f9fa; border-radius:10px; padding:20px; border-left:4px solid #3498db;">
+    <div style="color:#666; font-size:13px; text-transform:uppercase;">Total Revenue</div>
+    <div style="font-size:28px; font-weight:bold;">${latest['TOTAL_REVENUE']:,.0f}</div>
+    <div style="color:{color(rev_chg)}; font-size:14px;">{arrow(rev_chg)} {rev_chg:+.1f}% MoM</div>
+  </div>
+  <div style="flex:1; background:#f8f9fa; border-radius:10px; padding:20px; border-left:4px solid #2ecc71;">
+    <div style="color:#666; font-size:13px; text-transform:uppercase;">Net Revenue</div>
+    <div style="font-size:28px; font-weight:bold;">${latest['NET_REVENUE']:,.0f}</div>
+    <div style="color:{color(net_chg)}; font-size:14px;">{arrow(net_chg)} {net_chg:+.1f}% MoM</div>
+  </div>
+  <div style="flex:1; background:#f8f9fa; border-radius:10px; padding:20px; border-left:4px solid #9b59b6;">
+    <div style="color:#666; font-size:13px; text-transform:uppercase;">Net Interest Income</div>
+    <div style="font-size:28px; font-weight:bold;">${latest['NII']:,.0f}</div>
+    <div style="color:{color(nii_chg)}; font-size:14px;">{arrow(nii_chg)} {nii_chg:+.1f}% MoM</div>
+  </div>
+  <div style="flex:1; background:#f8f9fa; border-radius:10px; padding:20px; border-left:4px solid #e67e22;">
+    <div style="color:#666; font-size:13px; text-transform:uppercase;">Active Customers</div>
+    <div style="font-size:28px; font-weight:bold;">{latest['CUSTOMERS']:,.0f}</div>
+    <div style="color:#666; font-size:14px;">Latest reporting month</div>
+  </div>
+</div>
+"""
+display(HTML(html))
+```
+
+### Revenue Trend
+
+```{python}
+#| label: revenue-trend
+
+full_months = revenue[revenue["CUSTOMERS"] > 500].copy()
+
+fig = make_subplots(specs=[[{"secondary_y": True}]])
+fig.add_trace(
+    go.Bar(x=full_months["REVENUE_MONTH"], y=full_months["TOTAL_REVENUE"],
+           name="Total Revenue", marker_color="#3498db", opacity=0.7),
+    secondary_y=False,
+)
+fig.add_trace(
+    go.Scatter(x=full_months["REVENUE_MONTH"], y=full_months["NET_REVENUE"],
+               name="Net Revenue", line=dict(color="#2ecc71", width=3)),
+    secondary_y=False,
+)
+fig.update_layout(
+    title="Monthly Revenue Trend",
+    yaxis_title="Revenue ($)",
+    hovermode="x unified",
+    template="plotly_white",
+    height=400,
+)
+fig.show()
+```
+
+### Revenue Composition
+
+```{python}
+#| label: revenue-mix
+
+latest_mix = full_months.iloc[-1]
+labels = ["Net Interest Income", "Fee Revenue", "Interchange", "Loan Origination"]
+values = [latest_mix["NII"], latest_mix["FEE_REVENUE"], latest_mix["INTERCHANGE"], latest_mix["LOAN_ORIG"]]
+
+fig = px.pie(names=labels, values=values, hole=0.4,
+             color_discrete_sequence=["#3498db", "#2ecc71", "#9b59b6", "#e67e22"])
+fig.update_layout(title="Revenue Mix — Latest Month", template="plotly_white", height=400)
+fig.show()
+```
+
+## Portfolio Health
+
+```{python}
+#| label: balance-data
+
+balances = query("""
+    SELECT
+        b.SNAPSHOT_DATE,
+        COUNT(DISTINCT b.ACCOUNT_KEY) AS ACCOUNTS,
+        ROUND(AVG(b.CURRENT_BALANCE), 2) AS AVG_BALANCE,
+        ROUND(AVG(b.UTILIZATION_RATE), 2) AS AVG_UTILIZATION,
+        SUM(CASE WHEN b.IS_DORMANT THEN 1 ELSE 0 END) AS DORMANT_ACCOUNTS,
+        ROUND(SUM(b.CURRENT_BALANCE), 2) AS TOTAL_DEPOSITS
+    FROM FSI_DEMO.ANALYTICS_BANKING.FACT_ACCOUNT_BALANCE_DAILY b
+    GROUP BY b.SNAPSHOT_DATE
+    ORDER BY b.SNAPSHOT_DATE
+""")
+
+balances["SNAPSHOT_DATE"] = pd.to_datetime(balances["SNAPSHOT_DATE"])
+```
+
+```{python}
+#| label: balance-trend
+
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                    subplot_titles=("Total Deposits", "Average Balance per Account"))
+
+fig.add_trace(
+    go.Scatter(x=balances["SNAPSHOT_DATE"], y=balances["TOTAL_DEPOSITS"],
+               fill="tozeroy", fillcolor="rgba(52,152,219,0.2)",
+               line=dict(color="#3498db", width=2), name="Total Deposits"),
+    row=1, col=1,
+)
+fig.add_trace(
+    go.Scatter(x=balances["SNAPSHOT_DATE"], y=balances["AVG_BALANCE"],
+               line=dict(color="#e67e22", width=2), name="Avg Balance"),
+    row=2, col=1,
+)
+fig.update_layout(template="plotly_white", height=500, showlegend=False)
+fig.update_yaxes(title_text="$", row=1, col=1)
+fig.update_yaxes(title_text="$", row=2, col=1)
+fig.show()
+```
+
+## Digital Engagement
+
+```{python}
+#| label: engagement-data
+
+engagement = query("""
+    SELECT
+        ACTIVITY_DATE,
+        SUM(MOBILE_LOGIN_COUNT) AS MOBILE,
+        SUM(WEB_LOGIN_COUNT) AS WEB,
+        SUM(TABLET_LOGIN_COUNT) AS TABLET,
+        SUM(TOTAL_LOGIN_COUNT) AS TOTAL_LOGINS,
+        ROUND(AVG(DIGITAL_ENGAGEMENT_SCORE), 1) AS AVG_SCORE,
+        ROUND(AVG(SESSION_DURATION_MINUTES), 1) AS AVG_SESSION_MIN
+    FROM FSI_DEMO.ANALYTICS_BANKING.FACT_DIGITAL_ENGAGEMENT
+    GROUP BY ACTIVITY_DATE
+    ORDER BY ACTIVITY_DATE
+""")
+
+engagement["ACTIVITY_DATE"] = pd.to_datetime(engagement["ACTIVITY_DATE"])
+```
+
+```{python}
+#| label: channel-mix
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=engagement["ACTIVITY_DATE"], y=engagement["MOBILE"],
+                         stackgroup="one", name="Mobile", line=dict(color="#3498db")))
+fig.add_trace(go.Scatter(x=engagement["ACTIVITY_DATE"], y=engagement["WEB"],
+                         stackgroup="one", name="Web", line=dict(color="#2ecc71")))
+fig.add_trace(go.Scatter(x=engagement["ACTIVITY_DATE"], y=engagement["TABLET"],
+                         stackgroup="one", name="Tablet", line=dict(color="#9b59b6")))
+fig.update_layout(title="Daily Logins by Channel", yaxis_title="Login Count",
+                  template="plotly_white", height=400, hovermode="x unified")
+fig.show()
+```
+
+## Transaction Activity
+
+```{python}
+#| label: txn-data
+
+txns = query("""
+    SELECT
+        TRANSACTION_POST_DATE,
+        COUNT(*) AS TXN_COUNT,
+        ROUND(SUM(TRANSACTION_AMOUNT), 2) AS TOTAL_AMOUNT,
+        ROUND(AVG(TRANSACTION_AMOUNT), 2) AS AVG_AMOUNT,
+        SUM(CASE WHEN IS_HIGH_VALUE THEN 1 ELSE 0 END) AS HIGH_VALUE_COUNT,
+        SUM(CASE WHEN IS_INTERNATIONAL THEN 1 ELSE 0 END) AS INTL_COUNT,
+        SUM(CASE WHEN FRAUD_ALERT_FLAG THEN 1 ELSE 0 END) AS FRAUD_ALERTS
+    FROM FSI_DEMO.ANALYTICS_BANKING.FACT_TRANSACTION
+    GROUP BY TRANSACTION_POST_DATE
+    ORDER BY TRANSACTION_POST_DATE
+""")
+
+txns["TRANSACTION_POST_DATE"] = pd.to_datetime(txns["TRANSACTION_POST_DATE"])
+```
+
+```{python}
+#| label: txn-volume
+
+fig = make_subplots(specs=[[{"secondary_y": True}]])
+fig.add_trace(
+    go.Bar(x=txns["TRANSACTION_POST_DATE"], y=txns["TXN_COUNT"],
+           name="Transaction Count", marker_color="#3498db", opacity=0.6),
+    secondary_y=False,
+)
+fig.add_trace(
+    go.Scatter(x=txns["TRANSACTION_POST_DATE"], y=txns["TOTAL_AMOUNT"],
+               name="Total Amount ($)", line=dict(color="#e74c3c", width=2)),
+    secondary_y=True,
+)
+fig.update_layout(title="Daily Transaction Volume & Amount",
+                  template="plotly_white", height=400, hovermode="x unified")
+fig.update_yaxes(title_text="Count", secondary_y=False)
+fig.update_yaxes(title_text="Amount ($)", secondary_y=True)
+fig.show()
+```
+
+```{python}
+#| label: risk-summary
+
+from IPython.display import Markdown
+
+fraud_total = txns["FRAUD_ALERTS"].sum()
+high_val = txns["HIGH_VALUE_COUNT"].sum()
+intl = txns["INTL_COUNT"].sum()
+
+display(Markdown(f"""
+### Risk Snapshot
+
+| Metric | Count |
+|--------|------:|
+| Fraud Alerts | {fraud_total:,} |
+| High-Value Transactions (>$3K) | {high_val:,} |
+| International Transactions | {intl:,} |
+"""))
+```
+
+```{python}
+#| label: cleanup
+#| include: false
+
+cur.close()
+conn.close()
+```
+
+---
+
+*Report generated from FSI_DEMO on Snowflake. Data refreshed at render time.*

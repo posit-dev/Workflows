@@ -1,0 +1,365 @@
+---
+title: "Customer Churn Prediction Model"
+format: html
+jupyter: python3
+---
+
+# Customer Churn Prediction for FSI Banking
+
+This notebook builds a machine learning model to predict customer churn using XGBoost, with SHAP explanations for interpretability.
+
+## Setup
+
+```{python}
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import snowflake.connector
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+import xgboost as xgb
+import shap
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Snowflake connection
+conn = snowflake.connector.connect(
+    user=os.getenv('SNOWFLAKE_USER'),
+    password=os.getenv('SNOWFLAKE_PASSWORD'),
+    account=os.getenv('SNOWFLAKE_ACCOUNT'),
+    warehouse='DEFAULT_WH',
+    database='FSI_DEMO',
+    schema='ANALYTICS_BANKING'
+)
+
+print("✓ Connected to Snowflake")
+```
+
+## Data Preparation
+
+Join customer dimensions with behavioral facts to create features:
+
+```{python}
+query = """
+WITH customer_revenue_trend AS (
+    SELECT 
+        CUSTOMER_KEY,
+        AVG(NET_REVENUE) as avg_monthly_revenue,
+        STDDEV(NET_REVENUE) as revenue_volatility,
+        REGR_SLOPE(NET_REVENUE, MONTH_KEY) as revenue_trend_slope,
+        COUNT(*) as months_active
+    FROM FACT_CUSTOMER_REVENUE
+    WHERE MONTH_KEY >= DATEADD('month', -12, CURRENT_DATE())
+    GROUP BY CUSTOMER_KEY
+),
+engagement_trend AS (
+    SELECT 
+        CUSTOMER_KEY,
+        AVG(ENGAGEMENT_SCORE) as avg_engagement_score,
+        REGR_SLOPE(ENGAGEMENT_SCORE, DATE_KEY) as engagement_trend_slope,
+        SUM(TOTAL_LOGINS) as total_logins_12m,
+        AVG(MOBILE_LOGINS) / NULLIF(AVG(TOTAL_LOGINS), 0) as mobile_adoption_rate
+    FROM FACT_DIGITAL_ENGAGEMENT
+    WHERE DATE_KEY >= DATEADD('month', -12, CURRENT_DATE())
+    GROUP BY CUSTOMER_KEY
+),
+balance_behavior AS (
+    SELECT 
+        CUSTOMER_KEY,
+        AVG(CURRENT_BALANCE) as avg_balance,
+        STDDEV(CURRENT_BALANCE) as balance_volatility,
+        AVG(UTILIZATION_RATE) as avg_utilization,
+        SUM(CASE WHEN IS_DORMANT = TRUE THEN 1 ELSE 0 END) / COUNT(*) as dormancy_rate,
+        DATEDIFF('day', MAX(BALANCE_DATE), CURRENT_DATE()) as days_since_last_activity
+    FROM FACT_ACCOUNT_BALANCE_DAILY
+    WHERE BALANCE_DATE >= DATEADD('month', -12, CURRENT_DATE())
+    GROUP BY CUSTOMER_KEY
+)
+SELECT 
+    c.CUSTOMER_KEY,
+    c.CIF_NUMBER,
+    c.CREDIT_SCORE,
+    c.RISK_RATING,
+    c.CUSTOMER_SEGMENT,
+    c.TENURE_YEARS,
+    c.RELATIONSHIP_STATUS,
+    c.NUM_PRODUCTS,
+    r.avg_monthly_revenue,
+    r.revenue_volatility,
+    r.revenue_trend_slope,
+    r.months_active,
+    e.avg_engagement_score,
+    e.engagement_trend_slope,
+    e.total_logins_12m,
+    e.mobile_adoption_rate,
+    b.avg_balance,
+    b.balance_volatility,
+    b.avg_utilization,
+    b.dormancy_rate,
+    b.days_since_last_activity,
+    -- Define churn target: AT_RISK + low engagement + dormant behavior
+    CASE 
+        WHEN c.RELATIONSHIP_STATUS = 'AT_RISK' 
+             AND (e.avg_engagement_score < 50 OR b.dormancy_rate > 0.3)
+        THEN 1
+        WHEN b.days_since_last_activity > 90 
+             AND e.total_logins_12m < 5
+        THEN 1
+        ELSE 0
+    END as CHURNED
+FROM FSI_DEMO.CORE_BANKING.DIM_CUSTOMER c
+LEFT JOIN customer_revenue_trend r ON c.CUSTOMER_KEY = r.CUSTOMER_KEY
+LEFT JOIN engagement_trend e ON c.CUSTOMER_KEY = e.CUSTOMER_KEY
+LEFT JOIN balance_behavior b ON c.CUSTOMER_KEY = b.CUSTOMER_KEY
+WHERE r.CUSTOMER_KEY IS NOT NULL
+"""
+
+df = pd.read_sql(query, conn)
+print(f"✓ Loaded {len(df):,} customers")
+print(f"✓ Churn rate: {df['CHURNED'].mean():.1%}")
+```
+
+## Feature Engineering
+
+```{python}
+# Handle missing values
+df = df.fillna({
+    'revenue_volatility': 0,
+    'revenue_trend_slope': 0,
+    'engagement_trend_slope': 0,
+    'mobile_adoption_rate': 0,
+    'balance_volatility': 0,
+    'avg_utilization': 0,
+    'dormancy_rate': 0,
+    'days_since_last_activity': 365
+})
+
+# Encode categorical variables
+le_risk = LabelEncoder()
+le_segment = LabelEncoder()
+le_status = LabelEncoder()
+
+df['RISK_RATING_ENCODED'] = le_risk.fit_transform(df['RISK_RATING'])
+df['CUSTOMER_SEGMENT_ENCODED'] = le_segment.fit_transform(df['CUSTOMER_SEGMENT'])
+df['RELATIONSHIP_STATUS_ENCODED'] = le_status.fit_transform(df['RELATIONSHIP_STATUS'])
+
+# Select features for modeling
+feature_cols = [
+    'CREDIT_SCORE', 'TENURE_YEARS', 'NUM_PRODUCTS',
+    'avg_monthly_revenue', 'revenue_volatility', 'revenue_trend_slope', 'months_active',
+    'avg_engagement_score', 'engagement_trend_slope', 'total_logins_12m', 'mobile_adoption_rate',
+    'avg_balance', 'balance_volatility', 'avg_utilization', 'dormancy_rate', 'days_since_last_activity',
+    'RISK_RATING_ENCODED', 'CUSTOMER_SEGMENT_ENCODED', 'RELATIONSHIP_STATUS_ENCODED'
+]
+
+X = df[feature_cols]
+y = df['CHURNED']
+
+print(f"✓ Features: {len(feature_cols)}")
+print(f"✓ Feature names: {', '.join(feature_cols[:5])}...")
+```
+
+## Train/Test Split
+
+```{python}
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, random_state=42, stratify=y
+)
+
+print(f"✓ Training set: {len(X_train):,} samples")
+print(f"✓ Test set: {len(X_test):,} samples")
+print(f"✓ Train churn rate: {y_train.mean():.1%}")
+print(f"✓ Test churn rate: {y_test.mean():.1%}")
+```
+
+## Model Training with XGBoost
+
+```{python}
+# Handle class imbalance
+scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+
+model = xgb.XGBClassifier(
+    n_estimators=200,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    scale_pos_weight=scale_pos_weight,
+    random_state=42,
+    eval_metric='auc'
+)
+
+model.fit(
+    X_train, y_train,
+    eval_set=[(X_test, y_test)],
+    verbose=False
+)
+
+print("✓ Model trained successfully")
+```
+
+## Model Evaluation
+
+```{python}
+# Predictions
+y_pred = model.predict(X_test)
+y_pred_proba = model.predict_proba(X_test)[:, 1]
+
+# Metrics
+print("\n=== Classification Report ===")
+print(classification_report(y_test, y_pred, target_names=['Not Churned', 'Churned']))
+
+print(f"\n=== ROC AUC Score ===")
+roc_auc = roc_auc_score(y_test, y_pred_proba)
+print(f"ROC AUC: {roc_auc:.3f}")
+
+# Confusion Matrix
+cm = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=['Not Churned', 'Churned'],
+            yticklabels=['Not Churned', 'Churned'])
+plt.title('Confusion Matrix')
+plt.ylabel('Actual')
+plt.xlabel('Predicted')
+plt.show()
+```
+
+## Feature Importance
+
+```{python}
+# XGBoost feature importance
+importance_df = pd.DataFrame({
+    'feature': feature_cols,
+    'importance': model.feature_importances_
+}).sort_values('importance', ascending=False)
+
+plt.figure(figsize=(10, 8))
+plt.barh(importance_df['feature'].head(15), importance_df['importance'].head(15))
+plt.xlabel('Importance')
+plt.title('Top 15 Feature Importances')
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.show()
+
+print("\n=== Top 10 Features ===")
+print(importance_df.head(10).to_string(index=False))
+```
+
+## SHAP Explanations
+
+```{python}
+# Calculate SHAP values
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test)
+
+# Summary plot
+plt.figure(figsize=(10, 8))
+shap.summary_plot(shap_values, X_test, feature_names=feature_cols, show=False)
+plt.tight_layout()
+plt.show()
+
+# Force plot for a high-risk customer
+high_risk_idx = y_pred_proba.argmax()
+print(f"\n=== SHAP Explanation for Highest Risk Customer ===")
+print(f"Churn Probability: {y_pred_proba[high_risk_idx]:.1%}")
+shap.force_plot(
+    explainer.expected_value, 
+    shap_values[high_risk_idx], 
+    X_test.iloc[high_risk_idx],
+    feature_names=feature_cols,
+    matplotlib=True,
+    show=False
+)
+plt.tight_layout()
+plt.show()
+```
+
+## Score All Customers and Write to Snowflake
+
+```{python}
+# Score all customers
+X_all = df[feature_cols]
+churn_probabilities = model.predict_proba(X_all)[:, 1]
+churn_predictions = model.predict(X_all)
+
+# Create results dataframe
+results = pd.DataFrame({
+    'CUSTOMER_KEY': df['CUSTOMER_KEY'],
+    'CIF_NUMBER': df['CIF_NUMBER'],
+    'CHURN_PROBABILITY': churn_probabilities,
+    'CHURN_PREDICTION': churn_predictions,
+    'RISK_TIER': pd.cut(churn_probabilities, 
+                        bins=[0, 0.3, 0.6, 1.0], 
+                        labels=['Low', 'Medium', 'High']),
+    'MODEL_VERSION': 'v1.0_xgboost',
+    'SCORED_AT': datetime.now()
+})
+
+print(f"\n=== Churn Risk Distribution ===")
+print(results['RISK_TIER'].value_counts().sort_index())
+
+# Write to Snowflake
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE OR REPLACE TABLE FSI_DEMO.ANALYTICS_BANKING.ML_CHURN_SCORES (
+        CUSTOMER_KEY NUMBER,
+        CIF_NUMBER VARCHAR,
+        CHURN_PROBABILITY FLOAT,
+        CHURN_PREDICTION NUMBER,
+        RISK_TIER VARCHAR,
+        MODEL_VERSION VARCHAR,
+        SCORED_AT TIMESTAMP
+    )
+""")
+
+# Write data
+from snowflake.connector.pandas_tools import write_pandas
+write_pandas(
+    conn, 
+    results, 
+    'ML_CHURN_SCORES',
+    database='FSI_DEMO',
+    schema='ANALYTICS_BANKING'
+)
+
+print(f"\n✓ Wrote {len(results):,} churn scores to FSI_DEMO.ANALYTICS_BANKING.ML_CHURN_SCORES")
+```
+
+## Save Model Artifact
+
+```{python}
+import joblib
+
+model_path = 'churn_model_v1.pkl'
+joblib.dump({
+    'model': model,
+    'feature_cols': feature_cols,
+    'label_encoders': {
+        'RISK_RATING': le_risk,
+        'CUSTOMER_SEGMENT': le_segment,
+        'RELATIONSHIP_STATUS': le_status
+    },
+    'metrics': {
+        'roc_auc': roc_auc,
+        'train_date': datetime.now().isoformat()
+    }
+}, model_path)
+
+print(f"✓ Model saved to {model_path}")
+```
+
+## Summary
+
+- **Model**: XGBoost Classifier with {model.n_estimators} trees
+- **ROC AUC**: {roc_auc:.3f}
+- **Customers Scored**: {len(results):,}
+- **High Risk Customers**: {(results['RISK_TIER'] == 'High').sum():,} ({(results['RISK_TIER'] == 'High').mean():.1%})
+- **Output Table**: FSI_DEMO.ANALYTICS_BANKING.ML_CHURN_SCORES
+
+```{python}
+conn.close()
+print("\n✓ Connection closed")
+```

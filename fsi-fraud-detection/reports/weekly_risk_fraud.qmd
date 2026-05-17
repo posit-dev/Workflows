@@ -1,0 +1,143 @@
+---
+title: "Weekly Risk & Fraud Report"
+subtitle: "FSI Demo - Delinquency & Fraud Analysis"
+author: "FSI Analytics Team"
+date: today
+format: pdf
+execute:
+  echo: false
+  warning: false
+---
+
+```{r}
+library(DBI)
+library(tidyverse)
+library(ggplot2)
+library(gt)
+
+con <- conn
+```
+
+# Executive Summary
+
+This report provides weekly analysis of payment delinquency, fraud risk, and credit score migration.
+
+# High-Value Transactions
+
+```{r}
+high_value <- dbGetQuery(con, "
+SELECT 
+  TRANSACTION_ID,
+  CUSTOMER_KEY,
+  TRANSACTION_AMOUNT,
+  CHANNEL,
+  IS_INTERNATIONAL,
+  FRAUD_RISK_SCORE,
+  TRANSACTION_TIMESTAMP
+FROM FSI_DEMO.ANALYTICS_BANKING.FACT_TRANSACTION
+WHERE IS_HIGH_VALUE = 1
+  AND TRANSACTION_TIMESTAMP >= CURRENT_DATE() - 7
+ORDER BY TRANSACTION_AMOUNT DESC
+LIMIT 20
+")
+
+gt(high_value) |>
+  fmt_currency(columns = TRANSACTION_AMOUNT, currency = "USD") |>
+  fmt_number(columns = FRAUD_RISK_SCORE, decimals = 3)
+```
+
+# Fraud Score Distribution
+
+```{r}
+fraud_dist <- dbGetQuery(con, "
+SELECT 
+  CASE 
+    WHEN FRAUD_RISK_SCORE < 0.3 THEN 'Low'
+    WHEN FRAUD_RISK_SCORE < 0.6 THEN 'Medium'
+    ELSE 'High'
+  END as RISK_LEVEL,
+  COUNT(*) as TRANSACTION_COUNT
+FROM FSI_DEMO.ANALYTICS_BANKING.FACT_TRANSACTION
+WHERE TRANSACTION_TIMESTAMP >= CURRENT_DATE() - 7
+GROUP BY RISK_LEVEL
+")
+
+ggplot(fraud_dist, aes(x = RISK_LEVEL, y = TRANSACTION_COUNT, fill = RISK_LEVEL)) +
+  geom_col() +
+  labs(title = "Transaction Fraud Risk Distribution (Last 7 Days)", 
+       x = "Risk Level", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# Payment Delinquency Trends
+
+```{r}
+delinquency <- dbGetQuery(con, "
+SELECT 
+  CASE 
+    WHEN DAYS_LATE = 0 THEN 'Current'
+    WHEN DAYS_LATE <= 30 THEN '1-30 Days Late'
+    WHEN DAYS_LATE <= 60 THEN '31-60 Days Late'
+    ELSE '60+ Days Late'
+  END as DELINQUENCY_BUCKET,
+  COUNT(*) as PAYMENT_COUNT,
+  SUM(PAYMENT_AMOUNT) as TOTAL_AMOUNT
+FROM FSI_DEMO.RAW_BANKING.PAYMENT_HISTORY
+WHERE PAYMENT_DATE >= CURRENT_DATE() - 7
+GROUP BY DELINQUENCY_BUCKET
+")
+
+gt(delinquency) |>
+  fmt_currency(columns = TOTAL_AMOUNT, currency = "USD")
+```
+
+# Credit Score Migration
+
+```{r}
+credit_migration <- dbGetQuery(con, "
+SELECT 
+  CASE 
+    WHEN CREDIT_SCORE < 580 THEN 'Poor'
+    WHEN CREDIT_SCORE < 670 THEN 'Fair'
+    WHEN CREDIT_SCORE < 740 THEN 'Good'
+    ELSE 'Excellent'
+  END as CREDIT_BAND,
+  COUNT(*) as CUSTOMER_COUNT
+FROM FSI_DEMO.CORE_BANKING.DIM_CUSTOMER
+GROUP BY CREDIT_BAND
+ORDER BY CUSTOMER_COUNT DESC
+")
+
+ggplot(credit_migration, aes(x = CREDIT_BAND, y = CUSTOMER_COUNT, fill = CREDIT_BAND)) +
+  geom_col() +
+  labs(title = "Customer Distribution by Credit Score Band", 
+       x = "Credit Band", y = "Customer Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# Flagged Transactions
+
+```{r}
+flagged <- dbGetQuery(con, "
+SELECT 
+  TRANSACTION_ID,
+  CUSTOMER_KEY,
+  TRANSACTION_AMOUNT,
+  CHANNEL,
+  FRAUD_RISK_SCORE,
+  ANOMALY_SCORE
+FROM FSI_DEMO.ANALYTICS_BANKING.FACT_TRANSACTION ft
+LEFT JOIN FSI_DEMO.ANALYTICS_BANKING.ML_FRAUD_SCORES fs 
+  ON ft.TRANSACTION_KEY = fs.TRANSACTION_KEY
+WHERE (FRAUD_RISK_SCORE > 0.8 OR ANOMALY_SCORE > 0.8)
+  AND TRANSACTION_TIMESTAMP >= CURRENT_DATE() - 7
+ORDER BY FRAUD_RISK_SCORE DESC
+LIMIT 15
+")
+
+gt(flagged) |>
+  fmt_currency(columns = TRANSACTION_AMOUNT, currency = "USD") |>
+  fmt_number(columns = c(FRAUD_RISK_SCORE, ANOMALY_SCORE), decimals = 3)
+```

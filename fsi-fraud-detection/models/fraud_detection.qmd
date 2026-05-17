@@ -1,0 +1,377 @@
+---
+title: "Transaction Fraud Detection Model"
+subtitle: "Isolation Forest with Anomaly Scoring"
+author: "FSI Analytics Team"
+date: today
+format: html
+execute:
+  echo: true
+  warning: false
+---
+
+# Transaction Fraud Detection using Isolation Forest
+
+This notebook builds an anomaly detection model to identify potentially fraudulent transactions using Isolation Forest.
+
+## Setup
+
+```{python}
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import snowflake.connector
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, roc_auc_score, precision_recall_curve
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Snowflake connection
+conn = snowflake.connector.connect(
+    user=os.getenv('SNOWFLAKE_USER'),
+    password=os.getenv('SNOWFLAKE_PASSWORD'),
+    account=os.getenv('SNOWFLAKE_ACCOUNT'),
+    warehouse='DEFAULT_WH',
+    database='FSI_DEMO',
+    schema='ANALYTICS_BANKING'
+)
+
+print("✓ Connected to Snowflake")
+```
+
+## Load Transaction Data
+
+```{python}
+query = """
+SELECT 
+    t.TRANSACTION_KEY,
+    t.TRANSACTION_ID,
+    t.CUSTOMER_KEY,
+    t.ACCOUNT_KEY,
+    t.TRANSACTION_AMOUNT,
+    t.TRANSACTION_TYPE,
+    t.CHANNEL,
+    t.IS_INTERNATIONAL,
+    t.IS_HIGH_VALUE,
+    t.FRAUD_RISK_SCORE as EXISTING_FRAUD_SCORE,
+    t.TRANSACTION_TIMESTAMP,
+    HOUR(t.TRANSACTION_TIMESTAMP) as TRANSACTION_HOUR,
+    DAYOFWEEK(t.TRANSACTION_TIMESTAMP) as DAY_OF_WEEK,
+    c.CREDIT_SCORE,
+    c.RISK_RATING,
+    c.CUSTOMER_SEGMENT,
+    a.ACCOUNT_TYPE,
+    a.ACCOUNT_BALANCE,
+    a.CREDIT_LIMIT,
+    -- Calculate velocity features
+    COUNT(*) OVER (
+        PARTITION BY t.CUSTOMER_KEY 
+        ORDER BY t.TRANSACTION_TIMESTAMP 
+        RANGE BETWEEN INTERVAL '1 HOUR' PRECEDING AND CURRENT ROW
+    ) as transactions_last_hour,
+    SUM(t.TRANSACTION_AMOUNT) OVER (
+        PARTITION BY t.CUSTOMER_KEY 
+        ORDER BY t.TRANSACTION_TIMESTAMP 
+        RANGE BETWEEN INTERVAL '24 HOUR' PRECEDING AND CURRENT ROW
+    ) as amount_last_24h,
+    AVG(t.TRANSACTION_AMOUNT) OVER (
+        PARTITION BY t.CUSTOMER_KEY 
+        ORDER BY t.TRANSACTION_TIMESTAMP 
+        ROWS BETWEEN 10 PRECEDING AND 1 PRECEDING
+    ) as avg_amount_last_10_txn
+FROM FSI_DEMO.ANALYTICS_BANKING.FACT_TRANSACTION t
+LEFT JOIN FSI_DEMO.CORE_BANKING.DIM_CUSTOMER c ON t.CUSTOMER_KEY = c.CUSTOMER_KEY
+LEFT JOIN FSI_DEMO.CORE_BANKING.DIM_ACCOUNT a ON t.ACCOUNT_KEY = a.ACCOUNT_KEY
+WHERE t.TRANSACTION_TIMESTAMP >= DATEADD('month', -6, CURRENT_DATE())
+"""
+
+df = pd.read_sql(query, conn)
+print(f"✓ Loaded {len(df):,} transactions")
+print(f"✓ Date range: {df['TRANSACTION_TIMESTAMP'].min()} to {df['TRANSACTION_TIMESTAMP'].max()}")
+```
+
+## Feature Engineering
+
+```{python}
+# Create derived features
+df['amount_vs_avg_ratio'] = df['TRANSACTION_AMOUNT'] / (df['avg_amount_last_10_txn'] + 1)
+df['amount_vs_balance_ratio'] = df['TRANSACTION_AMOUNT'] / (df['ACCOUNT_BALANCE'] + 1)
+df['is_unusual_hour'] = ((df['TRANSACTION_HOUR'] < 6) | (df['TRANSACTION_HOUR'] > 22)).astype(int)
+df['is_weekend'] = (df['DAY_OF_WEEK'].isin([1, 7])).astype(int)
+
+# Encode categorical variables
+df['CHANNEL_ENCODED'] = pd.Categorical(df['CHANNEL']).codes
+df['TRANSACTION_TYPE_ENCODED'] = pd.Categorical(df['TRANSACTION_TYPE']).codes
+df['ACCOUNT_TYPE_ENCODED'] = pd.Categorical(df['ACCOUNT_TYPE']).codes
+df['RISK_RATING_ENCODED'] = pd.Categorical(df['RISK_RATING']).codes
+df['CUSTOMER_SEGMENT_ENCODED'] = pd.Categorical(df['CUSTOMER_SEGMENT']).codes
+
+# Handle missing values
+df = df.fillna({
+    'avg_amount_last_10_txn': df['TRANSACTION_AMOUNT'].median(),
+    'CREDIT_LIMIT': 0,
+    'CREDIT_SCORE': df['CREDIT_SCORE'].median()
+})
+
+# Select features for anomaly detection
+feature_cols = [
+    'TRANSACTION_AMOUNT',
+    'IS_INTERNATIONAL',
+    'IS_HIGH_VALUE',
+    'TRANSACTION_HOUR',
+    'DAY_OF_WEEK',
+    'transactions_last_hour',
+    'amount_last_24h',
+    'amount_vs_avg_ratio',
+    'amount_vs_balance_ratio',
+    'is_unusual_hour',
+    'is_weekend',
+    'CREDIT_SCORE',
+    'CHANNEL_ENCODED',
+    'TRANSACTION_TYPE_ENCODED',
+    'ACCOUNT_TYPE_ENCODED',
+    'RISK_RATING_ENCODED',
+    'CUSTOMER_SEGMENT_ENCODED'
+]
+
+X = df[feature_cols].copy()
+
+print(f"✓ Features: {len(feature_cols)}")
+print(f"✓ Feature names: {', '.join(feature_cols[:8])}...")
+```
+
+## Normalize Features
+
+```{python}
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+print("✓ Features normalized")
+```
+
+## Train Isolation Forest
+
+```{python}
+# Train model with contamination rate based on existing fraud scores
+contamination_rate = (df['EXISTING_FRAUD_SCORE'] > 0.7).mean()
+print(f"✓ Using contamination rate: {contamination_rate:.3f}")
+
+model = IsolationForest(
+    n_estimators=200,
+    contamination=contamination_rate,
+    max_samples='auto',
+    random_state=42,
+    n_jobs=-1
+)
+
+# Fit model
+model.fit(X_scaled)
+
+print("✓ Isolation Forest trained")
+```
+
+## Generate Anomaly Scores
+
+```{python}
+# Predict anomalies (-1 for anomaly, 1 for normal)
+predictions = model.predict(X_scaled)
+
+# Get anomaly scores (lower = more anomalous)
+anomaly_scores = model.score_samples(X_scaled)
+
+# Convert to 0-1 scale (higher = more anomalous)
+anomaly_scores_normalized = 1 - (anomaly_scores - anomaly_scores.min()) / (anomaly_scores.max() - anomaly_scores.min())
+
+df['ANOMALY_SCORE'] = anomaly_scores_normalized
+df['IS_ANOMALY'] = (predictions == -1).astype(int)
+
+print(f"✓ Anomalies detected: {df['IS_ANOMALY'].sum():,} ({df['IS_ANOMALY'].mean():.1%})")
+```
+
+## Model Evaluation
+
+Compare against existing fraud scores:
+
+```{python}
+# Create binary labels from existing fraud scores
+df['HIGH_FRAUD_RISK'] = (df['EXISTING_FRAUD_SCORE'] > 0.7).astype(int)
+
+# Calculate metrics
+if df['HIGH_FRAUD_RISK'].sum() > 0:
+    roc_auc = roc_auc_score(df['HIGH_FRAUD_RISK'], df['ANOMALY_SCORE'])
+    print(f"\n=== ROC AUC vs Existing Fraud Scores ===")
+    print(f"ROC AUC: {roc_auc:.3f}")
+    
+    # Classification report
+    print("\n=== Classification Report ===")
+    print(classification_report(
+        df['HIGH_FRAUD_RISK'], 
+        df['IS_ANOMALY'],
+        target_names=['Normal', 'Fraud']
+    ))
+```
+
+## Anomaly Score Distribution
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Histogram of anomaly scores
+axes[0].hist(df['ANOMALY_SCORE'], bins=50, edgecolor='black', alpha=0.7)
+axes[0].axvline(df['ANOMALY_SCORE'].quantile(0.95), color='red', linestyle='--', label='95th percentile')
+axes[0].set_xlabel('Anomaly Score')
+axes[0].set_ylabel('Frequency')
+axes[0].set_title('Distribution of Anomaly Scores')
+axes[0].legend()
+
+# Comparison with existing fraud scores
+axes[1].scatter(df['EXISTING_FRAUD_SCORE'], df['ANOMALY_SCORE'], alpha=0.3, s=10)
+axes[1].plot([0, 1], [0, 1], 'r--', label='Perfect agreement')
+axes[1].set_xlabel('Existing Fraud Score')
+axes[1].set_ylabel('Anomaly Score')
+axes[1].set_title('Anomaly Score vs Existing Fraud Score')
+axes[1].legend()
+
+plt.tight_layout()
+plt.show()
+```
+
+## Top Anomalous Transactions
+
+```{python}
+# Get top 20 most anomalous transactions
+top_anomalies = df.nlargest(20, 'ANOMALY_SCORE')[[
+    'TRANSACTION_ID', 'CUSTOMER_KEY', 'TRANSACTION_AMOUNT', 
+    'TRANSACTION_TYPE', 'CHANNEL', 'IS_INTERNATIONAL', 'IS_HIGH_VALUE',
+    'TRANSACTION_HOUR', 'transactions_last_hour', 'amount_vs_avg_ratio',
+    'ANOMALY_SCORE', 'EXISTING_FRAUD_SCORE'
+]]
+
+print("\n=== Top 20 Most Anomalous Transactions ===")
+print(top_anomalies.to_string(index=False))
+```
+
+## Feature Importance for Anomalies
+
+Analyze which features contribute most to high anomaly scores:
+
+```{python}
+# Compare feature distributions for anomalies vs normal
+anomalies = df[df['IS_ANOMALY'] == 1]
+normal = df[df['IS_ANOMALY'] == 0]
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+axes = axes.flatten()
+
+key_features = [
+    'TRANSACTION_AMOUNT', 'transactions_last_hour', 'amount_vs_avg_ratio',
+    'IS_INTERNATIONAL', 'IS_HIGH_VALUE', 'is_unusual_hour'
+]
+
+for idx, feature in enumerate(key_features):
+    if feature in ['IS_INTERNATIONAL', 'IS_HIGH_VALUE', 'is_unusual_hour']:
+        # Bar plot for binary features
+        normal_pct = normal[feature].mean()
+        anomaly_pct = anomalies[feature].mean()
+        axes[idx].bar(['Normal', 'Anomaly'], [normal_pct, anomaly_pct], color=['blue', 'red'], alpha=0.7)
+        axes[idx].set_ylabel('Proportion')
+    else:
+        # Box plot for continuous features
+        axes[idx].boxplot([normal[feature].dropna(), anomalies[feature].dropna()], 
+                          labels=['Normal', 'Anomaly'])
+        axes[idx].set_ylabel(feature)
+    
+    axes[idx].set_title(feature)
+
+plt.tight_layout()
+plt.show()
+```
+
+## Write Results to Snowflake
+
+```{python}
+# Create results dataframe
+results = df[[
+    'TRANSACTION_KEY',
+    'TRANSACTION_ID',
+    'CUSTOMER_KEY',
+    'ACCOUNT_KEY',
+    'ANOMALY_SCORE',
+    'IS_ANOMALY',
+    'EXISTING_FRAUD_SCORE'
+]].copy()
+
+results['FRAUD_TIER'] = pd.cut(
+    results['ANOMALY_SCORE'], 
+    bins=[0, 0.7, 0.85, 1.0], 
+    labels=['Low', 'Medium', 'High']
+)
+results['MODEL_VERSION'] = 'v1.0_isolation_forest'
+results['SCORED_AT'] = datetime.now()
+
+print(f"\n=== Fraud Risk Distribution ===")
+print(results['FRAUD_TIER'].value_counts().sort_index())
+
+# Write to Snowflake
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE OR REPLACE TABLE FSI_DEMO.ANALYTICS_BANKING.ML_FRAUD_SCORES (
+        TRANSACTION_KEY NUMBER,
+        TRANSACTION_ID VARCHAR,
+        CUSTOMER_KEY NUMBER,
+        ACCOUNT_KEY NUMBER,
+        ANOMALY_SCORE FLOAT,
+        IS_ANOMALY NUMBER,
+        EXISTING_FRAUD_SCORE FLOAT,
+        FRAUD_TIER VARCHAR,
+        MODEL_VERSION VARCHAR,
+        SCORED_AT TIMESTAMP
+    )
+""")
+
+# Write data
+from snowflake.connector.pandas_tools import write_pandas
+write_pandas(
+    conn, 
+    results, 
+    'ML_FRAUD_SCORES',
+    database='FSI_DEMO',
+    schema='ANALYTICS_BANKING'
+)
+
+print(f"\n✓ Wrote {len(results):,} fraud scores to FSI_DEMO.ANALYTICS_BANKING.ML_FRAUD_SCORES")
+```
+
+## Save Model Artifact
+
+```{python}
+import joblib
+
+model_path = 'fraud_model_v1.pkl'
+joblib.dump({
+    'model': model,
+    'scaler': scaler,
+    'feature_cols': feature_cols,
+    'contamination_rate': contamination_rate,
+    'metrics': {
+        'roc_auc': roc_auc if 'roc_auc' in locals() else None,
+        'train_date': datetime.now().isoformat()
+    }
+}, model_path)
+
+print(f"✓ Model saved to {model_path}")
+```
+
+## Summary
+
+- **Model**: Isolation Forest with {model.n_estimators} trees
+- **Contamination Rate**: {contamination_rate:.3f}
+- **Transactions Scored**: {len(results):,}
+- **High Risk Transactions**: {(results['FRAUD_TIER'] == 'High').sum():,} ({(results['FRAUD_TIER'] == 'High').mean():.1%})
+- **Output Table**: FSI_DEMO.ANALYTICS_BANKING.ML_FRAUD_SCORES
+
+```{python}
+conn.close()
+print("\n✓ Connection closed")
+```

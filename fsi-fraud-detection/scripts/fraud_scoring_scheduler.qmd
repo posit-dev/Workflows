@@ -1,0 +1,39 @@
+
+---
+title: "Fraud Scoring Scheduler"
+format: html
+execute:
+  echo: false
+---
+
+This document triggers the fraud scoring API endpoint.
+
+```{python}
+import requests
+import os
+from datetime import datetime
+
+# Get the API URL from environment variable
+api_url = os.getenv("SCORING_API_URL", "https://connect/content/7e5d8668-64b8-465f-8450-2095c8067c19/score")
+
+print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Triggering fraud scoring...")
+print(f"API URL: {api_url}")
+
+try:
+    response = requests.post(api_url, timeout=300)
+    
+    if response.status_code == 200:
+        result = response.json()
+        transactions_scored = result.get('transactions_scored', 0)
+        status = result.get('status', 'unknown')
+        
+        print(f"✓ SUCCESS: Scored {transactions_scored} transactions")
+        print(f"  Status: {status}")
+    else:
+        print(f"✗ ERROR: API returned status code {response.status_code}")
+        print(f"  Response: {response.text}")
+        
+except requests.exceptions.Timeout:
+    print("✗ ERROR: Request timed out after 5 minutes")
+except Exception as e:
+    print(f"✗ ERROR: {str(e)}")
